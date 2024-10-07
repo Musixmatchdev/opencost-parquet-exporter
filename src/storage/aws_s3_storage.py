@@ -39,7 +39,6 @@ class S3Storage(BaseStorage):
         window = pd.to_datetime(config['window_start'])
         # pylint: disable=C0301
         parquet_prefix = config['parquet_prefix']
-        # parquet_prefix = f"{config['file_key_prefix']}/year={window.year}/month={window.month}/day={window.day}"
 
         try:
             if config['s3_bucket']:
