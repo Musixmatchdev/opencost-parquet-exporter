@@ -12,7 +12,6 @@ import pandas as pd
 import requests
 from storage_factory import get_storage
 
-
 def load_config_file(file_path: str):
     """
     Loads and returns the a JSON file specified by the file path.
@@ -153,18 +152,32 @@ def get_config(
             'gcp_credentials': json.loads(os.environ.get('OPENCOST_PARQUET_GCP_CREDENTIALS_JSON', '{}')),
         })
 
-    # If window is not specified assume we want yesterday data.
+    if step == '1h' and window_start is not None:
+        window_start_dt = datetime.strptime(window_start, "%Y-%m-%dT%H:%M:%SZ")
+        hour = window_start_dt.replace(minute=0, second=0, microsecond=0)
+        window_start = hour.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+        window_end = (hour + timedelta(minutes=59, seconds=59)).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+    elif step == '1h':
+        now = datetime.now()
+        previous_hour = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        window_start = previous_hour.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+        window_end = (previous_hour + timedelta(minutes=59, seconds=59)).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+
+    # If window is not specified assume we want yesterday data (step != 1h).
     if window_start is None or window_end is None:
         yesterday = datetime.strftime(
             datetime.now() - timedelta(1), '%Y-%m-%d')
         window_start = yesterday+'T00:00:00Z'
         window_end = yesterday+'T23:59:59Z'
+
     if parquet_prefix is None:
       window = datetime.strptime(window_start, "%Y-%m-%dT%H:%M:%SZ")
       parquet_prefix = os.environ.get(
         'OPENCOST_PARQUET_PREFIX',
         f"{file_key_prefix}/year={window.year}/month={window.month}/day={window.day}"
       )
+    
+    print(f"window_start: {window_start}  window_end: {window_end}")
     config['parquet_prefix'] = parquet_prefix
     window = f"{window_start},{window_end}"
     config['window_start'] = window_start
@@ -222,8 +235,25 @@ def request_data(config):
         print(f"Request error: {err}")
         return None
 
+def remove_keys_from_result(d = {}, path = '', keys_to_remove = []):
+    if len(keys_to_remove) == 0:
+        return
+    if path != "":
+        path = f"{path}."
+    for key in list(d.keys()):
+        if path == "" and key.lower() in keys_to_remove:
+            d.pop(key, None)
+        elif f"{path}{key}".lower() in keys_to_remove:
+            d.pop(key, None)
+        elif isinstance(d[key], dict):
+            remove_keys_from_result(d[key], f"{path}{key}" , keys_to_remove)
 
-def process_result(result, ignored_alloc_keys, rename_cols, data_types):
+    for key in list(d.keys()):
+        if isinstance(d[key], dict) and len(list(d[key].keys())) == 0:
+            d.pop(key, None)
+    return
+
+def process_result(result, ignored_alloc_keys, rename_cols, data_types, ignore_columns):
     """
     Process raw results from the OpenCost API data request.
     Parameters:
@@ -243,6 +273,13 @@ def process_result(result, ignored_alloc_keys, rename_cols, data_types):
         for alloc_name in split.keys():
             for ignored_key in ignored_alloc_keys:
                 split[alloc_name].pop(ignored_key, None)
+
+    for split in result:
+        for alloc_name in split.keys():
+            remove_keys_from_result(
+                d=split[alloc_name], 
+                keys_to_remove=ignore_columns)
+
     try:
         frames = [
             pd.json_normalize(
@@ -305,8 +342,15 @@ def main():
     rename_cols = load_config_file(
         file_path=f'{os.path.dirname(os.path.abspath(__file__))}/rename_cols.json')
     print("Load allocation keys to ignore")
-    ignore_alloc_keys = load_config_file(
+    _ignore_alloc_keys = load_config_file(
         file_path=f'{os.path.dirname(os.path.abspath(__file__))}/ignore_alloc_keys.json')
+    ignore_alloc_keys = _ignore_alloc_keys['keys']
+    
+    ignore_columns = []
+    ignore_columns_str = os.environ.get('OPENCOST_PARQUET_INGNORE_COLUMNS', None)
+    if ignore_columns_str is not None:
+        _ignore_columns = ignore_columns_str.split(',')
+        ignore_columns = [s.strip() for s in _ignore_columns]
 
     print("Build config")
     config = get_config()
@@ -322,7 +366,9 @@ def main():
         result=result,
         ignored_alloc_keys=ignore_alloc_keys,
         rename_cols=rename_cols,
-        data_types=data_types)
+        data_types=data_types,
+        ignore_columns=ignore_columns
+    )
     if processed_data is None:
         print("Processed data is None, aborting execution.")
         sys.exit(1)
