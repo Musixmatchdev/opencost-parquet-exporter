@@ -3,9 +3,19 @@ import unittest
 from unittest.mock import patch, MagicMock, mock_open
 import json
 import os
+from datetime import datetime
 import requests
+import pandas as pd
 from freezegun import freeze_time
-from opencost_parquet_exporter import get_config, request_data, load_config_file
+from opencost_parquet_exporter import (
+    get_config,
+    request_data,
+    load_config_file,
+    load_structured_file,
+    load_schema_file,
+    apply_schema,
+    process_result,
+)
 
 
 class TestGetConfig(unittest.TestCase):
@@ -169,6 +179,37 @@ class TestGetConfig(unittest.TestCase):
             self.assertNotIn('s3_bucket', config)
             self.assertEqual(config['params'][0][1], window)
 
+    def test_get_config_with_idle_env_vars(self):
+        """Test get_config overrides parquet prefix when env var is set."""
+        with patch.dict(os.environ, {
+            'OPENCOST_PARQUET_INCLUDE_IDLE': 'true',
+            'OPENCOST_PARQUET_IDLE_BY_NODE': 'true'}, clear=True):
+            config = get_config()
+            self.assertEqual(config['params'][2][0], 'includeIdle')
+            self.assertEqual(config['params'][2][1], 'true')
+
+            self.assertEqual(config['params'][3][0], 'idleByNode')
+            self.assertEqual(config['params'][3][1], 'true')
+
+    @freeze_time('2024-06-29')
+    def test_get_config_with_parquet_prefix_env_var(self):
+        yesterday = '2024-06-28'
+        window_start = yesterday+'T01:00:00Z'
+        window = datetime.strptime(window_start, "%Y-%m-%dT%H:%M:%SZ")
+
+        """Test get_config overrides parquet prefix when env var is set."""
+        with patch.dict(os.environ, {
+            'OPENCOST_PARQUET_FILE_KEY_PREFIX': 'test-prefix/',
+            'OPENCOST_PARQUET_PREFIX': f"year={window.year}/month={window.month}/day={window.day}/hour={window.hour}",
+            'OPENCOST_PARQUET_STEP': '1m'}, clear=True):
+            config = get_config()
+            self.assertEqual(config['parquet_prefix'], 'year=2024/month=6/day=28/hour=1')
+
+    @freeze_time('2024-06-29')
+    def test_get_config_with_default_parquet_prefix_env_var(self):
+        """Test get_config with default parquet prefix when env var is not set."""
+        config = get_config()
+        self.assertEqual(config['parquet_prefix'], '/tmp//year=2024/month=6/day=28')
 
 class TestRequestData(unittest.TestCase):
     """ Test request_data method """
@@ -280,6 +321,194 @@ class TestLoadConfigMaps(unittest.TestCase):
         """ Test the function's response to an empty JSON file """
         with self.assertRaises(json.JSONDecodeError):
             load_config_file(self.empty_json_path)
+
+
+class TestLoadSchemaFile(unittest.TestCase):
+    """Test cases for load_structured_file and load_schema_file methods"""
+
+    def setUp(self):
+        self.test_dir = 'test_schemas'
+        os.makedirs(self.test_dir, exist_ok=True)
+
+    def tearDown(self):
+        for file in os.listdir(self.test_dir):
+            os.remove(os.path.join(self.test_dir, file))
+        os.rmdir(self.test_dir)
+
+    def write_file(self, name, content):
+        """ Write content to a file inside the test directory and return its path """
+        path = os.path.join(self.test_dir, name)
+        with open(path, 'w', encoding='utf-8') as file:
+            file.write(content)
+        return path
+
+    def test_load_structured_file_json(self):
+        """ Test loading a JSON file """
+        path = self.write_file('schema.json', '{"cpuCost": "float"}')
+        self.assertEqual(load_structured_file(path), {"cpuCost": "float"})
+
+    def test_load_structured_file_yaml(self):
+        """ Test loading a YAML file """
+        path = self.write_file(
+            'schema.yaml', 'cpuCost:\n  type: float\n  default: 0.0\n')
+        self.assertEqual(
+            load_structured_file(path),
+            {"cpuCost": {"type": "float", "default": 0.0}})
+
+    def test_load_structured_file_unknown_extension(self):
+        """ Test that an unknown extension falls back to JSON then YAML """
+        json_path = self.write_file('schema.txt', '{"cpuCost": "float"}')
+        self.assertEqual(load_structured_file(json_path), {"cpuCost": "float"})
+        yaml_path = self.write_file('other.txt', 'cpuCost: float\n')
+        self.assertEqual(load_structured_file(yaml_path), {"cpuCost": "float"})
+
+    def test_load_structured_file_invalid_json(self):
+        """ Test that invalid JSON raises a ValueError """
+        path = self.write_file('schema.json', '{"cpuCost": "float",}')
+        with self.assertRaises(ValueError):
+            load_structured_file(path)
+
+    def test_load_schema_file_normalizes_definitions(self):
+        """ Test that plain type strings and objects are both accepted """
+        path = self.write_file('schema.yaml', '\n'.join([
+            'properties.namespace:',
+            '  type: string',
+            '  default: ""',
+            'totalCost: float',
+            'label.team:',
+            '  type: string',
+        ]))
+        schema = load_schema_file(path)
+        self.assertEqual(schema, {
+            'properties.namespace': {'type': 'string', 'default': ''},
+            'totalCost': {'type': 'float'},
+            'label.team': {'type': 'string'},
+        })
+        # The declaration order is preserved, it drives the parquet column order.
+        self.assertEqual(
+            list(schema.keys()),
+            ['properties.namespace', 'totalCost', 'label.team'])
+
+    def test_load_schema_file_empty(self):
+        """ Test that an empty schema raises a ValueError """
+        path = self.write_file('schema.json', '{}')
+        with self.assertRaises(ValueError):
+            load_schema_file(path)
+
+    def test_load_schema_file_missing_type(self):
+        """ Test that a column definition without a type raises a ValueError """
+        path = self.write_file('schema.yaml', 'cpuCost:\n  default: 0.0\n')
+        with self.assertRaises(ValueError):
+            load_schema_file(path)
+
+    def test_load_schema_file_unsupported_key(self):
+        """ Test that an unsupported key in a column definition raises a ValueError """
+        path = self.write_file(
+            'schema.yaml', 'cpuCost:\n  type: float\n  fallback: 0.0\n')
+        with self.assertRaises(ValueError):
+            load_schema_file(path)
+
+    def test_load_schema_file_not_found(self):
+        """ Test the response when the schema file does not exist """
+        with self.assertRaises(FileNotFoundError):
+            load_schema_file(os.path.join(self.test_dir, 'nonexistent.yaml'))
+
+
+class TestApplySchema(unittest.TestCase):
+    """Test cases for apply_schema method"""
+
+    def test_projects_orders_and_casts_columns(self):
+        """ Test that only the declared columns are kept, in the declared order """
+        data = pd.DataFrame({
+            'totalCost': ['1.5'],
+            'dropMe': ['whatever'],
+            'properties.namespace': ['kube-system'],
+        })
+        schema = {
+            'properties.namespace': {'type': 'string', 'default': ''},
+            'totalCost': {'type': 'float', 'default': 0.0},
+        }
+        result = apply_schema(data, schema)
+        self.assertEqual(
+            list(result.columns), ['properties.namespace', 'totalCost'])
+        self.assertEqual(result['totalCost'].tolist(), [1.5])
+
+    def test_creates_missing_columns_with_default(self):
+        """ Test that columns missing from the data are created with their default """
+        data = pd.DataFrame({'totalCost': [2.0]})
+        schema = {
+            'totalCost': {'type': 'float', 'default': 0.0},
+            'label.team': {'type': 'string', 'default': 'unknown'},
+        }
+        result = apply_schema(data, schema)
+        self.assertEqual(result['label.team'].tolist(), ['unknown'])
+
+    def test_fills_null_values_with_default(self):
+        """ Test that null values of existing columns are replaced by the default """
+        data = pd.DataFrame({'totalCost': [None, 3.0]})
+        result = apply_schema(data, {'totalCost': {'type': 'float', 'default': 0.0}})
+        self.assertEqual(result['totalCost'].tolist(), [0.0, 3.0])
+
+    def test_missing_column_without_default_stays_null(self):
+        """ Test that a column without a default is created as null """
+        data = pd.DataFrame({'totalCost': [1.0]})
+        result = apply_schema(data, {
+            'totalCost': {'type': 'float'},
+            'gpuCost': {'type': 'float'},
+        })
+        self.assertTrue(result['gpuCost'].isna().all())
+
+    def test_invalid_cast_raises_value_error(self):
+        """ Test that a column that cannot be cast raises a ValueError """
+        data = pd.DataFrame({'totalCost': ['not-a-number']})
+        with self.assertRaises(ValueError):
+            apply_schema(data, {'totalCost': {'type': 'float'}})
+
+
+class TestProcessResultWithSchema(unittest.TestCase):
+    """Test cases for process_result when a parquet schema is provided"""
+
+    def setUp(self):
+        self.result = [{
+            'kube-system/pod-1/container-1': {
+                'name': 'kube-system/pod-1/container-1',
+                'minutes': 60,
+                'totalCost': 1.25,
+                'pvs': {'some': 'value'},
+                'properties': {'namespace': 'kube-system', 'pod': 'pod-1'},
+            },
+        }]
+
+    def test_schema_replaces_data_types(self):
+        """ Test that the schema drives the exported columns instead of data_types """
+        schema = {
+            'properties.namespace': {'type': 'string', 'default': ''},
+            'running_minutes': {'type': 'float', 'default': 0.0},
+            'gpuCost': {'type': 'float', 'default': 0.0},
+        }
+        processed = process_result(
+            result=self.result,
+            ignored_alloc_keys=['pvs'],
+            rename_cols={'minutes': 'running_minutes'},
+            data_types={'this': 'would-fail'},
+            schema=schema,
+        )
+        self.assertEqual(
+            list(processed.columns),
+            ['properties.namespace', 'running_minutes', 'gpuCost'])
+        self.assertEqual(processed['running_minutes'].tolist(), [60.0])
+        self.assertEqual(processed['gpuCost'].tolist(), [0.0])
+
+    def test_without_schema_data_types_are_used(self):
+        """ Test that the previous behaviour is preserved when no schema is given """
+        processed = process_result(
+            result=self.result,
+            ignored_alloc_keys=['pvs'],
+            rename_cols={'minutes': 'running_minutes'},
+            data_types={'running_minutes': 'float', 'totalCost': 'float'},
+        )
+        self.assertIn('properties.pod', processed.columns)
+        self.assertEqual(processed['running_minutes'].tolist(), [60.0])
 
 
 if __name__ == '__main__':

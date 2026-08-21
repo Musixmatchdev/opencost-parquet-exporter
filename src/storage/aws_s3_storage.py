@@ -6,6 +6,7 @@ import os
 import pandas as pd
 from botocore.exceptions import ClientError, PartialCredentialsError, NoCredentialsError
 from .base_storage import BaseStorage
+from datetime import datetime
 
 # pylint: disable=R0903
 
@@ -32,10 +33,12 @@ class S3Storage(BaseStorage):
             str | None: The full S3 object path if the upload is successful, None otherwise.
 
         """
-        file_name = 'k8s_opencost.parquet'
+        window_dt = datetime.strptime(config['window_start'], "%Y-%m-%dT%H:%M:%SZ")
+        file_name = 'opencost_' + window_dt.strftime('%Y-%m-%d_%H_%M_%S') + '.parquet'
+
         window = pd.to_datetime(config['window_start'])
         # pylint: disable=C0301
-        parquet_prefix = f"{config['file_key_prefix']}/year={window.year}/month={window.month}/day={window.day}"
+        parquet_prefix = config['parquet_prefix']
 
         try:
             if config['s3_bucket']:
