@@ -6,7 +6,7 @@ This script was created to export data from opencost in PARQUET format.
 It supports exporting the data to S3, Azure Blob Storage, GCP Cloud Storage, and local directory.
 
 # Dependencies
-This script depends on boto3, pandas, numpy, python-dateutil, azure-identity, azure-storage-blob, and google-cloud-storage.
+This script depends on boto3, pandas, numpy, python-dateutil, PyYAML, azure-identity, azure-storage-blob, and google-cloud-storage.
 
 The file requirements.txt has all the dependencies specified.
 
@@ -26,6 +26,136 @@ The script supports the following environment variables:
 * OPENCOST_PARQUET_IDLE_BY_NODE: If `"true"`, idle allocations are created on a per-node basis, which will result in different values when shared and more idle allocations when split. Default is `"false"`.
 * OPENCOST_PARQUET_STORAGE_BACKEND: The storage backend to use. Supports `aws`, `azure`, `gcp`. See below for Azure and GCP-specific variables.
 * OPENCOST_PARQUET_JSON_SEPARATOR: The OpenCost API returns nested objects. The used [JSON normalization method](https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.json_normalize.html) allows for a custom separator. Use this to specify the separator of your choice.
+* OPENCOST_PARQUET_SCHEMA_FILE: Path to a JSON or YAML file describing the schema of the parquet file. By default this is None and `src/data_types.json` is used. See [Custom parquet schema](#custom-parquet-schema).
+
+## Custom parquet schema
+By default the exported columns are whatever the OpenCost API returns, and `src/data_types.json` only assigns a type to the known numeric ones. This means the parquet schema changes whenever OpenCost omits a field or adds a new one, which is a problem for consumers with a fixed schema such as Athena or BigQuery external tables.
+
+Set OPENCOST_PARQUET_SCHEMA_FILE to a JSON or YAML file to take full control of the schema. The format is picked from the file extension (`.json`, `.yaml`, `.yml`). When the variable is set, the file **replaces** `src/data_types.json` and defines the export completely:
+
+* only the declared columns are exported, in the declared order, everything else is dropped;
+* a column missing from the OpenCost response is created with its `default`, so the schema stays stable across exports;
+* null values of a declared column are replaced by its `default`;
+* every column is cast to its declared `type`, which is any type accepted by [pandas astype](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.astype.html), e.g. `string`, `float`, `int64`, `bool`.
+
+Each entry is either a plain type string, exactly like `data_types.json`, or an object with a mandatory `type` and an optional `default`. Without a `default`, missing values stay null.
+
+YAML:
+```yaml
+properties.namespace: { type: string, default: "" }
+running_minutes: { type: float, default: 0.0 }
+label.team: { type: string, default: "unknown" }
+gpuCost: { type: float, default: 0.0 }
+totalCost: float
+```
+
+JSON:
+```json
+{
+  "properties.namespace": {"type": "string", "default": ""},
+  "running_minutes": {"type": "float", "default": 0.0},
+  "label.team": {"type": "string", "default": "unknown"},
+  "gpuCost": {"type": "float", "default": 0.0},
+  "totalCost": "float"
+}
+```
+
+Column names are the ones of the final parquet file, so they are the names **after** `src/rename_cols.json` has been applied (`minutes` is `running_minutes`, `properties.labels.team` is `label.team`) and nested objects are flattened with OPENCOST_PARQUET_JSON_SEPARATOR (`.` by default).
+
+If the variable is set but the file is missing, unreadable or invalid, the export fails with a non-zero exit code instead of silently writing a parquet with an unexpected schema. YAML support requires PyYAML, which is included in requirements.txt.
+
+See [examples/parquet_schema.yaml](examples/parquet_schema.yaml) for a complete example.
+
+### Normalizing files exported before the schema was introduced
+`tools/normalize_parquet.py` applies a schema to a parquet file that is already in a bucket, so old exports can be aligned to the same schema as the new ones. It downloads the object, drops the columns that are not declared, creates the missing ones with their default, fills the null values, casts every column to its declared type and writes the result to a local file with the same name as the object.
+
+#### Setup
+The tool needs Python 3.9 or later and the full `requirements.txt`: it imports the exporter to share the schema handling, and the exporter loads all the storage backends, so the Azure and GCP libraries are needed even when normalizing a file from S3.
+
+```bash
+# 1. Clone the repository and enter it
+git clone git@github.com:Musixmatchdev/opencost-parquet-exporter.git
+cd opencost-parquet-exporter
+
+# 2. Create the virtualenv and activate it
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# 3. Install the dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 4. Check that the tool runs
+python3 tools/normalize_parquet.py --help
+```
+
+Make sure AWS credentials are available to boto3, using whatever mechanism you already use, for example:
+
+```bash
+export AWS_PROFILE=my-profile
+# or
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_SESSION_TOKEN=...
+# or, on EKS, the IAM role attached to the pod service account
+aws sts get-caller-identity          # verify which identity will be used
+```
+
+When you are done, leave the virtualenv with `deactivate`. To also run the test suite, install the development dependencies with `pip install -r requirements-dev.txt` and run `pytest -v`.
+
+#### Normalizing a single file
+
+```bash
+$ python3 tools/normalize_parquet.py \
+    --bucket s3://my-bucket \
+    --key cluster=my-cluster/year=2026/month=8/day=20/opencost_2026-08-20_10_00_00.parquet \
+    --schema schema.yaml \
+    --output-dir ./normalized
+```
+
+It reuses the same schema handling as the exporter, so the normalized file holds the data the export would have produced with that schema. Note that the two files are not byte identical, so `cmp` or `md5sum` will report a difference even when normalizing a file that already matches the schema: this tool writes with `index=False`, therefore the `pandas` key of the parquet footer has an empty `index_columns` instead of the `RangeIndex` descriptor the exporter writes. Arrow schema, dtypes, compression, encodings and every value are the same, and no query engine reads that metadata. Compare files with pandas or `pyarrow`, not with a checksum. The summary reports what changed:
+
+```
+Schema loaded, 94 columns declared
+Parquet file read, 2295 rows and 93 columns
+Rows normalized: 2295
+Columns dropped (2): properties.annotations.checksum_cm, properties.namespaceAnnotations.mxmdescription
+Columns added from their default (3): gpuCost, window.end, properties.labels.mxm_team
+Null values replaced by their default in 2 columns:
+  totalCost: 5
+  properties.namespace: 3
+Normalized file saved at: ./normalized/opencost_2026-08-20_10_00_00.parquet
+```
+
+#### Normalizing a whole directory
+With `--recursive` the key is a directory and every parquet file below it is normalized, so a whole cluster or year can be backfilled in one run. The directory structure below the key is recreated inside the output directory, which keeps the Hive style partitions intact:
+
+```bash
+$ python3 tools/normalize_parquet.py \
+    --bucket s3://my-bucket \
+    --recursive --key cluster=my-cluster/year=2026 \
+    --schema schema.yaml \
+    --output-dir ./normalized
+# ./normalized/month=8/day=20/opencost_2026-08-20_10_00_00.parquet, and so on
+```
+
+Objects that are not parquet files, such as `_SUCCESS` markers, are skipped and counted. A file that cannot be read or normalized does not stop the run: it is reported at the end and the exit code is 1, so a partial backfill is never mistaken for a complete one.
+
+#### Replacing the objects in the bucket
+By default the tool is a **dry run**: it writes the normalized files locally and leaves the bucket untouched, so you can inspect the result and the summary before committing to anything. Pass `--no-dry-run` to upload every normalized file back, **replacing the original object** at the same key:
+
+```bash
+$ python3 tools/normalize_parquet.py \
+    --bucket s3://my-bucket \
+    --recursive --key cluster=my-cluster/year=2026 \
+    --schema schema.yaml \
+    --output-dir ./normalized \
+    --no-dry-run
+```
+
+The local copy is always written first and the upload only happens for files that were normalized successfully, so a corrupted or non conforming file is reported and skipped instead of being replaced by a broken object. Both modes print which one is active, at the start and at the end of the run.
+
+This overwrites data in place and cannot be undone unless the bucket has versioning enabled, so the recommended sequence is: run the dry run first, check the summary and the local files, then repeat the exact same command with `--no-dry-run`.
+
+AWS credentials are the standard boto3 ones, the same used by the exporter. Replacing objects also needs `s3:PutObject` on the prefix, while a dry run only needs `s3:GetObject` and `s3:ListBucket`.
 
 ## Azure Specific Environment Variables
 * OPENCOST_PARQUET_AZURE_STORAGE_ACCOUNT_NAME: Name of the Azure Storage Account you want to export the data to.

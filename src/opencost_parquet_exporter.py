@@ -12,6 +12,12 @@ import pandas as pd
 import requests
 from storage_factory import get_storage
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
 def load_config_file(file_path: str):
     """
     Loads and returns the a JSON file specified by the file path.
@@ -25,6 +31,135 @@ def load_config_file(file_path: str):
     with open(file_path, 'r', encoding="utf-8") as file:
         config = json.load(file)
     return config
+
+
+def _parse_yaml(content: str, file_path: str):
+    """
+    Parse YAML content, raising a ValueError if PyYAML is unavailable or the content is invalid.
+    """
+    if yaml is None:
+        raise ValueError(
+            f"cannot parse '{file_path}': PyYAML is not installed, "
+            "install it or use a JSON file instead")
+    try:
+        return yaml.safe_load(content)
+    except yaml.YAMLError as err:
+        raise ValueError(f"invalid YAML in '{file_path}': {err}") from err
+
+
+def load_structured_file(file_path: str):
+    """
+    Load a JSON or YAML file. The format is chosen based on the file extension,
+    falling back to "try JSON, then YAML" for any other extension.
+
+    Parameters:
+        file_path (str): The path to the JSON or YAML file.
+
+    Returns:
+        The deserialized content of the file.
+
+    Raises:
+        ValueError: If the content cannot be deserialized.
+    """
+    extension = os.path.splitext(file_path)[1].lower()
+    with open(file_path, 'r', encoding="utf-8") as file:
+        content = file.read()
+    if extension in ('.yaml', '.yml'):
+        return _parse_yaml(content, file_path)
+    if extension == '.json':
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as err:
+            raise ValueError(f"invalid JSON in '{file_path}': {err}") from err
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return _parse_yaml(content, file_path)
+
+
+def load_schema_file(file_path: str):
+    """
+    Load the parquet schema definition from a JSON or YAML file.
+
+    The file is a mapping of column name to either a type string, like data_types.json,
+    or an object with a mandatory 'type' and an optional 'default':
+
+        {
+            "properties.namespace": {"type": "string", "default": ""},
+            "cpuCost": {"type": "float", "default": 0.0},
+            "totalCost": "float"
+        }
+
+    Column names are the ones used in the parquet file, therefore after rename_cols.json
+    has been applied. The order of the columns in the file is the order used in the export.
+
+    Parameters:
+        file_path (str): The path to the schema file.
+
+    Returns:
+        dict: Mapping of column name to a definition dict with 'type' and, optionally, 'default'.
+
+    Raises:
+        ValueError: If the schema file is empty or does not follow the expected structure.
+    """
+    raw_schema = load_structured_file(file_path)
+    if not isinstance(raw_schema, dict) or not raw_schema:
+        raise ValueError(
+            f"invalid schema in '{file_path}': "
+            "expected a non empty mapping of column name to column definition")
+
+    schema = {}
+    for column, definition in raw_schema.items():
+        if isinstance(definition, str):
+            schema[column] = {'type': definition}
+            continue
+        if not isinstance(definition, dict):
+            raise ValueError(
+                f"invalid schema in '{file_path}': column '{column}' must be a type string "
+                "or an object with a 'type' and an optional 'default'")
+        if not isinstance(definition.get('type'), str):
+            raise ValueError(
+                f"invalid schema in '{file_path}': column '{column}' must define a string 'type'")
+        unsupported = sorted(set(definition) - {'type', 'default'})
+        if unsupported:
+            raise ValueError(
+                f"invalid schema in '{file_path}': column '{column}' "
+                f"has unsupported keys: {', '.join(unsupported)}")
+        schema[column] = {'type': definition['type']}
+        if 'default' in definition:
+            schema[column]['default'] = definition['default']
+    return schema
+
+
+def apply_schema(data, schema):
+    """
+    Enforce the schema on the normalized data: create the missing columns using their
+    default value, fill the null values of the existing ones, cast every column to its
+    declared type and finally keep only the declared columns, in the declared order.
+
+    Parameters:
+    - data (DataFrame): Normalized and renamed OpenCost data.
+    - schema (dict): Mapping of column name to a definition with 'type' and optional 'default'.
+
+    Returns:
+    - DataFrame: Data with exactly the columns declared in the schema.
+
+    Raises:
+        ValueError: If a column cannot be cast to its declared type.
+    """
+    for column, definition in schema.items():
+        default = definition.get('default', None)
+        if column not in data.columns:
+            print(f"Column '{column}' is missing from the data, using default: {default!r}")
+            data[column] = default
+        elif default is not None:
+            data[column] = data[column].fillna(default)
+        try:
+            data[column] = data[column].astype(definition['type'])
+        except (ValueError, TypeError) as err:
+            raise ValueError(
+                f"cannot cast column '{column}' to '{definition['type']}': {err}") from err
+    return data[list(schema.keys())]
 
 # pylint: disable=R0912,R0913,R0914,R0915
 
@@ -235,32 +370,17 @@ def request_data(config):
         print(f"Request error: {err}")
         return None
 
-def remove_keys_from_result(d = {}, path = '', keys_to_remove = []):
-    if len(keys_to_remove) == 0:
-        return
-    if path != "":
-        path = f"{path}."
-    for key in list(d.keys()):
-        if path == "" and key.lower() in keys_to_remove:
-            d.pop(key, None)
-        elif f"{path}{key}".lower() in keys_to_remove:
-            d.pop(key, None)
-        elif isinstance(d[key], dict):
-            remove_keys_from_result(d[key], f"{path}{key}" , keys_to_remove)
-
-    for key in list(d.keys()):
-        if isinstance(d[key], dict) and len(list(d[key].keys())) == 0:
-            d.pop(key, None)
-    return
-
-def process_result(result, ignored_alloc_keys, rename_cols, data_types, ignore_columns):
+def process_result(result, ignored_alloc_keys, rename_cols, data_types, schema=None):
     """
     Process raw results from the OpenCost API data request.
     Parameters:
     - result (dict): Raw response data from the OpenCost API.
     - ignored_alloc_keys (dict): Allocation keys to ignore
     - rename_cols (dict): Key-value pairs for coloumns to rename
-    - data_types (dict): Data types for properties of OpenCost response 
+    - data_types (dict): Data types for properties of OpenCost response
+    - schema (dict): Optional parquet schema, as returned by load_schema_file. When set it
+                     replaces data_types: only the declared columns are exported, in the
+                     declared order, with their default value and type applied.
 
     Returns:
     - DataFrame or None: Processed data as a Pandas DataFrame, or None if an error occurs.
@@ -274,12 +394,6 @@ def process_result(result, ignored_alloc_keys, rename_cols, data_types, ignore_c
             for ignored_key in ignored_alloc_keys:
                 split[alloc_name].pop(ignored_key, None)
 
-    for split in result:
-        for alloc_name in split.keys():
-            remove_keys_from_result(
-                d=split[alloc_name], 
-                keys_to_remove=ignore_columns)
-
     try:
         frames = [
             pd.json_normalize(
@@ -288,7 +402,10 @@ def process_result(result, ignored_alloc_keys, rename_cols, data_types, ignore_c
             for split in result]
         processed_data = pd.concat(frames)
         processed_data.rename(columns=rename_cols, inplace=True)
-        processed_data = processed_data.astype(data_types)
+        if schema:
+            processed_data = apply_schema(processed_data, schema)
+        else:
+            processed_data = processed_data.astype(data_types)
     except pd.errors.EmptyDataError as err:
         print(f"No data: {err}")
         return None
@@ -345,12 +462,18 @@ def main():
     _ignore_alloc_keys = load_config_file(
         file_path=f'{os.path.dirname(os.path.abspath(__file__))}/ignore_alloc_keys.json')
     ignore_alloc_keys = _ignore_alloc_keys['keys']
-    
-    ignore_columns = []
-    ignore_columns_str = os.environ.get('OPENCOST_PARQUET_INGNORE_COLUMNS', None)
-    if ignore_columns_str is not None:
-        _ignore_columns = ignore_columns_str.split(',')
-        ignore_columns = [s.strip() for s in _ignore_columns]
+
+    schema = None
+    schema_file = os.environ.get('OPENCOST_PARQUET_SCHEMA_FILE', None)
+    if schema_file is not None:
+        print(f"Load parquet schema from {schema_file}")
+        try:
+            schema = load_schema_file(file_path=schema_file)
+        except (OSError, ValueError) as err:
+            print(f"Failed to load parquet schema: {err}. Aborting execution")
+            sys.exit(1)
+        print(f"Parquet schema loaded, {len(schema)} columns declared, "
+              "data_types.json is ignored")
 
     print("Build config")
     config = get_config()
@@ -367,7 +490,7 @@ def main():
         ignored_alloc_keys=ignore_alloc_keys,
         rename_cols=rename_cols,
         data_types=data_types,
-        ignore_columns=ignore_columns
+        schema=schema
     )
     if processed_data is None:
         print("Processed data is None, aborting execution.")

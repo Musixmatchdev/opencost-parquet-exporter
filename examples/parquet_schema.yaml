@@ -1,0 +1,63 @@
+# Example parquet schema, to be used with OPENCOST_PARQUET_SCHEMA_FILE.
+#
+# When this file is provided it replaces src/data_types.json and it defines the whole
+# parquet schema: only the columns declared here are exported, in this exact order.
+#
+# Column names are the ones of the final parquet file, therefore after the renames of
+# src/rename_cols.json have been applied (for example "minutes" is "running_minutes")
+# and using OPENCOST_PARQUET_JSON_SEPARATOR to flatten nested objects ("." by default).
+#
+# Each column is either:
+#   - a plain type string, exactly like src/data_types.json, or
+#   - an object with a mandatory "type" and an optional "default".
+#
+# The default value is used both for columns missing from the OpenCost response, which
+# keeps the parquet schema stable across exports, and to fill null values. Without a
+# default, missing values stay null.
+#
+# The same file can be written in JSON, the format is chosen from the file extension.
+
+name: { type: string, default: "" }
+window.start: { type: string, default: "" }
+window.end: { type: string, default: "" }
+running_start_time: { type: string, default: "" }
+running_end_time: { type: string, default: "" }
+running_minutes: { type: float, default: 0.0 }
+
+properties.cluster: { type: string, default: "" }
+properties.namespace: { type: string, default: "" }
+properties.pod: { type: string, default: "" }
+properties.container: { type: string, default: "" }
+properties.node: { type: string, default: "" }
+properties.providerID: { type: string, default: "" }
+
+label.team: { type: string, default: "" }
+label.product: { type: string, default: "" }
+label.project: { type: string, default: "" }
+
+cpuCores: { type: float, default: 0.0 }
+cpuCoreHours: { type: float, default: 0.0 }
+cpuCost: { type: float, default: 0.0 }
+cpuCostAdjustment: { type: float, default: 0.0 }
+cpuEfficiency: { type: float, default: 0.0 }
+
+ramBytes: { type: float, default: 0.0 }
+ramByteHours: { type: float, default: 0.0 }
+ramCost: { type: float, default: 0.0 }
+ramCostAdjustment: { type: float, default: 0.0 }
+ramEfficiency: { type: float, default: 0.0 }
+
+gpuCount: { type: float, default: 0.0 }
+gpuHours: { type: float, default: 0.0 }
+gpuCost: { type: float, default: 0.0 }
+
+pvBytes: { type: float, default: 0.0 }
+pvByteHours: { type: float, default: 0.0 }
+pvCost: { type: float, default: 0.0 }
+
+networkCost: { type: float, default: 0.0 }
+loadBalancerCost: { type: float, default: 0.0 }
+sharedCost: { type: float, default: 0.0 }
+externalCost: { type: float, default: 0.0 }
+totalCost: { type: float, default: 0.0 }
+totalEfficiency: { type: float, default: 0.0 }
